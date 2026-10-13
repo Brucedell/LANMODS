@@ -1,0 +1,602 @@
+================================================================================
+GAME ENGINE SCOUTING WORKFLOW  -  handoff for an AI agent
+================================================================================
+Version 1 (written from the L.A. Noire wanted-system project)
+
+PURPOSE
+-------
+This file tells an agent how to go from "a PC game and Cheat Engine" to a level
+of control like the L.A. Noire project reached:
+  - player root, entity list and manager singletons
+  - a game-thread hook to run code on
+  - an understanding of how objects are referenced and freed
+  - spawning, weapons, and the AI levers (plans/behaviours, factions,
+    relationships, perception)
+
+It is written so that the slow, one-at-a-time discovery from L.A. Noire is done
+in bulk and in the right order this time.
+
+STARTING STATE (assume exactly this)
+------------------------------------
+  - The game is installed on the user's Windows PC.
+  - Cheat Engine is installed and connected to the agent through the Cheat
+    Engine MCP bridge (tools such as evaluate_lua, read_memory, aob_scan,
+    disassemble, get_rtti_classname, set_data_breakpoint).
+  - NOTHING ELSE. No Ghidra project and no notes. The agent walks the user
+    through creating the Ghidra analysis (Phase 2) before deep scouting.
+
+WHO DOES WHAT
+-------------
+  - The USER does physical things: launches the game, clicks GUI buttons
+    (Ghidra, Cheat Engine, Windows dialogs), plays the game to trigger events,
+    runs admin commands, edits config files.
+  - The AGENT does analysis through MCP tools, writes the notes, tells the user
+    exactly what to do next, then WAITS for the user to confirm.
+  - Never assume a user step happened. After the user says "done", verify with
+    a tool call when possible (for example, list Ghidra functions over MCP).
+  - Give one clear instruction block at a time. Say what the user should see
+    when it worked.
+
+
+================================================================================
+1. GROUND RULES (read before touching anything)
+================================================================================
+SAFETY AND SCOPE
+  - Single-player/offline games the user owns, only. If the game is online or
+    ships kernel or user-mode anti-cheat (EasyAntiCheat, BattlEye, Vanguard,
+    nProtect, XIGNCODE and the like), STOP and tell the user.
+  - Never redistribute game files, extracted assets or decompiled code.
+  - Back up saves before the first modded session.
+
+ENGINEERING RULES (each one cost days on L.A. Noire)
+  R1  Read first, patch second. Do not write a patch until the code has been
+      read (Ghidra) and the behaviour confirmed live (Cheat Engine).
+  R2  Never call game functions from a Cheat Engine thread (executeCode,
+      createThread). The game's own threads are using the same data, and it
+      crashes. Call game functions only from a hook that runs on the game's
+      own thread (Phase 6).
+  R3  No "crash guards" as fixes. A guard (validate a pointer and skip) hides
+      the bug and moves the crash. If one exists, it is a counter that logs.
+      A guard hit is a bug to find, not a bug fixed.
+  R4  One variable per test. Every build prints a unique build marker in its
+      log on load. Check the marker before trusting a test, because stale
+      script copies get loaded by mistake.
+  R5  Crash dumps are always on (Phase 0). Every crash is decoded before
+      the next change.
+  R6  After about 3 identical failures, stop and change approach. Write down
+      what is known.
+  R7  Verify before claiming. Mark every fact in the notes as VERIFIED (seen
+      live or in code) or GUESS. Never present a guess as a finding.
+  R8  Searches must be complete. If a tool returns exactly 100 (or another
+      round number of) results, assume it was capped and page through, or use
+      a tool without caps.
+  R9  Hooks:
+        - check the original bytes before patching
+        - keep the stack balanced on EVERY path, including skip paths
+        - re-encode relative calls and jumps you move
+        - check the calling convention (stdcall "ret N" versus cdecl)
+        - make sure the cave is big enough (check the code end against the
+          allocation size)
+        - restore all bytes on unload
+  R10 A death/reload "reset" must touch NOTHING in the game world. Only clear
+      the script's own lists. After a reload, every remembered address
+      belongs to something else.
+  R11 Attach Cheat Engine only at the main menu or in-game, never during
+      startup.
+
+
+================================================================================
+2. PHASE 0 - LAB SETUP (15 min)
+================================================================================
+Make a notes folder (for example C:\Tools\<Game>\) containing:
+  MODLOG.md        running journal: versions, every finding, every failure
+                   with its cause
+  SCOUT_REPORT.md  the structured report (template in section 13)
+  logs\  dumps\    log files and crash dumps
+
+Crash dumps (the user runs this in an ADMIN Command Prompt; replace Game.exe
+with the exact exe name):
+  reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\Game.exe" /v DumpFolder /t REG_EXPAND_SZ /d "C:\Tools\<Game>\dumps" /f
+  reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\Game.exe" /v DumpType /t REG_DWORD /d 1 /f
+  reg add "HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\Game.exe" /v DumpCount /t REG_DWORD /d 10 /f
+  - DumpType 1 = minidump (small; registers and stack only).
+  - Switch to DumpType 2 (full dump, which includes the heap) when an
+    investigation needs object or refcount state at the crash.
+
+Record in MODLOG.md:
+  - game title, store (Steam/EA/GOG/...), build number, exe path, exe size,
+    exe SHA-256 (PowerShell: Get-FileHash Game.exe)
+  - all addresses you write down are valid for this one build only
+
+Save backup: copy the save folder somewhere safe.
+
+
+================================================================================
+3. PHASE 1 - FINGERPRINT (15-30 min, Cheat Engine only)
+================================================================================
+With the game at the main menu, the user attaches Cheat Engine. Then the agent
+collects:
+
+3.1 Process facts
+  - the exe's bitness (targetIs64Bit()), module base, module size
+  - the list of loaded modules (DLLs), with paths
+
+3.2 Is the base address fixed?
+  Read the PE header: e_lfanew = [base+0x3C]; DllCharacteristics is in the
+  optional header. Bit 0x40 = DYNAMIC_BASE (ASLR).
+    - Record the module base on two separate launches.
+    - Same base both times: you can rebase Ghidra to it and use absolute
+      addresses everywhere (L.A. Noire: always 004A0000).
+    - Base changes: keep Ghidra at the file's preferred base and store
+      everything as module offsets. Cheat Engine accepts "Game.exe+1234AB".
+
+3.3 Engine markers -> pick the fastest route
+  Unreal (GNames/GObjects, UE4/UE5 strings, *-Win64-Shipping.exe)
+      -> UE4SS / Dumper-7 dump every class and field first
+  Unity Mono (mono.dll, Managed\Assembly-CSharp.dll)
+      -> dnSpy/ILSpy: you get readable C#
+  Unity IL2CPP (GameAssembly.dll + global-metadata.dat)
+      -> Il2CppDumper / Cpp2IL
+  Source (CreateInterface exports, client.dll/server.dll)
+      -> community SDKs
+  Lua embedded (lua5x.dll, luajit, or strings like "lua_pcall", "luaL_register")
+      -> PRIORITY: find the table of native functions registered to Lua. It is
+         the game's own scripting API (spawn, set faction, give weapon...).
+  RAGE / other famous engines -> look for existing script hooks and dumpers
+  None of the above (custom C++, like L.A. Noire)
+      -> the RTTI route (Phase 3)
+  Also search the web for existing tools for THIS game: archive unpackers,
+  trainers, pointer tables, wikis.
+
+3.4 Protection check
+  - anti-cheat modules or services -> STOP (rule above)
+  - the exe's code section looks encrypted on disk -> Phase 2 needs an
+    unpacked copy (2.2)
+
+
+================================================================================
+4. PHASE 2 - CREATE THE GHIDRA ANALYSIS (agent guides the user, 1-2 h mostly waiting)
+================================================================================
+4.1 Install (user)
+  - Ghidra 12.1.x (ghidra-sre.org or the NationalSecurityAgency/ghidra GitHub
+    releases). Unzip it somewhere like C:\Tools\ghidra_12.1.x_PUBLIC.
+  - A 64-bit full JDK, version 21 or newer (for example Eclipse Temurin).
+  - Start ghidraRun.bat.
+
+4.2 Choose the input file
+  - Default: the exe from the game folder.
+  - If the agent's check (3.4) or Ghidra shows garbage in the code section, the
+    on-disk exe is encrypted or packed:
+      Steam DRM (a ".bind" section) -> Steamless produces an unpacked exe
+      other packers -> dump the running module (for example the Scylla plugin
+                       for x64dbg) and rebuild its imports
+    Analyse the unpacked copy. Never modify the original game files.
+
+4.3 Project and import (user)
+  - File > New Project > Non-Shared > folder C:\Tools\<Game>\ghidra, name
+    <Game>.
+  - File > Import File > the exe. Format: Portable Executable (PE); language
+    auto-detected (x86:LE:32 or x86:LE:64). OK.
+  - Double-click the program to open the CodeBrowser.
+  - When asked "Analyze now?" answer NO for the moment.
+
+4.4 Rebase (only if 3.2 showed a fixed base)
+  - Window > Memory Map > house icon "Set Image Base" > enter the runtime base
+    from Cheat Engine. Now Ghidra addresses equal Cheat Engine addresses.
+  - Otherwise skip this step and use module offsets.
+
+4.5 Analyze (user)
+  - Analysis > Auto Analyze. Keep the defaults and make sure the RTTI analyzer
+    is ticked ("Windows x86 PE RTTI Analyzer").
+  - Watch the bottom-right progress bar. It is done when the bar disappears;
+    a summary dialog may appear.
+  - "Could not find an appropriate PDB file" is NORMAL (games ship no debug
+    symbols). Click OK.
+  - Big games take 20-60 min. Then press Ctrl+S (File > Save '<exe>').
+
+4.6 Connect Ghidra to the agent: GhidraMCP (user, agent guides)
+  - The GhidraMCP release download is a bundle. Extract it. Inside are the real
+    extension (another zip) and bridge_mcp_ghidra.py.
+  - Ghidra project window: File > Install Extensions > green + > choose the
+    INNER zip.
+      Red text = it was built for a different Ghidra version. Edit
+      %APPDATA%\ghidra\ghidra_<ver>_PUBLIC\Extensions\GhidraMCP\extension.properties
+      and set version=<your exact Ghidra version>. Restart Ghidra.
+  - Restart Ghidra and open the CodeBrowser. Enable the plugin: File >
+    Configure > plug icon ("Configure All Plugins") > filter "MCP" > tick
+    GhidraMCPPlugin. Then File > Save Tool, so it stays enabled.
+  - Test: http://127.0.0.1:8080/methods in a browser lists function names.
+  - Python: pip install mcp requests
+  - Add to the MCP client config (Claude Desktop: claude_desktop_config.json
+    under "mcpServers"; back up the file first):
+        "ghidra": {
+          "command": "python",
+          "args": ["C:/Tools/GhidraMCP/bridge_mcp_ghidra.py",
+                   "--ghidra-server", "http://127.0.0.1:8080/"]
+        }
+    Fully quit and restart the client.
+  - The CodeBrowser must stay open whenever the agent uses Ghidra. Game
+    crashes do not affect Ghidra.
+  - Remind the user to press Ctrl+S after the agent renames things.
+
+4.7 Optional: REA (complete searches, no result caps)
+  - npm install --global rea-agents   (needs Node.js 22.19+ or 24.11+)
+  - Set GHIDRA_INSTALL_DIR, JAVA_HOME, REA_ANALYSIS_PROVIDER=ghidra,
+    GHIDRA_HEADLESS_MAXMEM=6G, REA_GHIDRA_STARTUP_TIMEOUT_MS=3600000.
+    Then run: rea doctor --json, then rea setup.
+  - On Windows it is experimental and READ-ONLY: use it for complete
+    listings, searches and cross-references, and GhidraMCP for renames.
+  - 32-bit exes need version 6.0 or newer.
+  - It runs its own import at the file's preferred base, so convert addresses
+    when the Ghidra project is rebased.
+
+4.8 Sanity check (agent)
+  - Decompile the entry point and one function you can tie to a known string.
+  - Compare a few bytes at a code address read through Cheat Engine with the
+    same address in Ghidra (after converting addresses if needed). They must
+    match.
+
+
+================================================================================
+5. PHASE 3 - RTTI CENSUS: MAP THE ENGINE IN BULK (1-3 h)
+================================================================================
+Goal: a list of every C++ class with its vtable and LIVE INSTANCE COUNT.
+  - Classes with exactly 1 live instance  = managers and singletons
+                                            (the roots of everything)
+  - Classes with many live instances      = entities, components, states
+
+5.1 Get the class list (preferred: from Ghidra)
+  - The RTTI analyzer labels each class's vftable, type descriptor and
+    complete object locator.
+  - Through MCP, list all symbols/labels containing "vftable" (PAGE through
+    every result; GhidraMCP returns pages of about 100) or use REA for one
+    complete listing.
+  - Save "ClassName <tab> vtable address" to classes.txt in the notes folder.
+
+5.2 Filter to interesting classes first. Name keywords:
+  Player Actor Character Pawn Ped NPC Human Enemy Civilian Police Cop
+  AI Brain Behavior Behaviour Plan Task Goal Directive State Controller
+  Faction Team Relationship Hostile Squad Group Perception Awareness Sense
+  Target Threat Spawn Population Pool Density Cull Manager System World
+  Scene Entity Object Handle WeakRef RefCount Ref Weapon Gun Ammo Vehicle Car
+  Camera Game Mission Case Script Lua Event Wanted Crime Alert Heat Witness
+  Then run the census on the whole list in batches.
+
+5.3 Count live instances and find static roots (Cheat Engine Lua)
+  Paste this into the Cheat Engine Lua engine, or send it through
+  evaluate_lua. Set MODULE first. It uses MSVC RTTI and works on 32 and 64
+  bit. Treat it as a template: test it on a few known classes first, and fix
+  details if the bridge reports errors.
+
+  ------------------------------------------------------------------------
+  MODULE = "Game.exe"
+  PS   = targetIs64Bit() and 8 or 4
+  BASE = getAddress(MODULE)
+  SIZE = getModuleSize(MODULE)
+
+  function inModule(a) return a and a >= BASE and a < BASE + SIZE end
+
+  function bytesAob(v, n)                 -- little-endian AOB string
+    local t = {}
+    for i = 0, n - 1 do t[#t+1] = string.format("%02X", (v >> (8*i)) & 0xFF) end
+    return table.concat(t, " ")
+  end
+  function ptrAob(v) return bytesAob(v, PS) end
+
+  function scanAll(aob, prot, align)      -- every hit, as numbers
+    local out = {}
+    local r = AOBScan(aob, prot or "*X*C*W", 1, tostring(align or PS))
+    if r then
+      for i = 0, r.Count - 1 do out[#out+1] = tonumber(r[i], 16) end
+      r.destroy()
+    end
+    return out
+  end
+
+  function className(obj)                 -- RTTI name of a live object
+    local vt = readPointer(obj);      if not inModule(vt)  then return nil end
+    local col = readPointer(vt - PS); if not inModule(col) then return nil end
+    local td
+    if PS == 8 then
+      if readInteger(col) ~= 1 then return nil end
+      td = BASE + readInteger(col + 0xC)  -- x64: RVA of the type descriptor
+    else
+      if readInteger(col) ~= 0 then return nil end
+      td = readPointer(col + 0xC)         -- x86: absolute pointer
+    end
+    if not inModule(td) then return nil end
+    return readString(td + 2*PS, 256)     -- ".?AVName@@"
+  end
+
+  function liveInstances(vt)              -- objects start with their vtable
+    local heap = {}
+    for _, a in ipairs(scanAll(ptrAob(vt), "+W")) do
+      if not inModule(a) then heap[#heap+1] = a end
+    end
+    return heap
+  end
+
+  function staticRoots(obj)               -- globals in the exe that point at obj
+    local roots = {}
+    for _, a in ipairs(scanAll(ptrAob(obj), "+W")) do
+      if inModule(a) then roots[#roots+1] = string.format("%s+%X", MODULE, a - BASE) end
+    end
+    return roots
+  end
+
+  function census(list, outPath)          -- list = { {name=..., vt=...}, ... }
+    local f = io.open(outPath, "a")
+    for _, c in ipairs(list) do
+      local inst = liveInstances(c.vt)
+      local line = string.format("%-70s vt=%X live=%d", c.name, c.vt, #inst)
+      if #inst == 1 then
+        line = line .. "  SINGLETON obj=" .. string.format("%X", inst[1])
+               .. " roots=" .. table.concat(staticRoots(inst[1]), ",")
+      end
+      f:write(line, "\n")
+    end
+    f:close()
+  end
+  ------------------------------------------------------------------------
+
+  Practical notes:
+  - Each scan covers all writable memory. Run 25-50 classes per call and
+    append to the file. Bridge calls can time out after a few minutes (a full
+    memory scan did on L.A. Noire).
+  - The game should be in a normal gameplay scene (NPCs present) and paused.
+  - The counts are approximate (a stray value can match). Confirm a singleton
+    by checking that className(obj) returns the expected class.
+  - A static root found this way is a CANDIDATE. Confirm it survives a level
+    reload and a game restart (with a fixed base) before trusting it.
+  - The Cheat Engine MCP may also offer a get_rtti_classname tool. Use it to
+    identify any pointer you meet.
+
+5.4 CE-only fallback (when Ghidra is not ready yet)
+  - Names: scanAll("2E 3F 41 56", "-X", 4) finds ".?AV" strings. Keep hits
+    inside the module. Each one is a type-descriptor name; the descriptor
+    starts at the name minus 2*PS.
+  - Filter by keyword BEFORE resolving vtables (this route is slow).
+  - The complete object locator is the address that references the
+    descriptor, minus 0xC (x86: absolute pointer; x64: 4-byte RVA, so scan
+    with alignment 4). Check its signature (0 on x86, 1 on x64) and that
+    [locator+4] = 0 (primary vtable).
+  - The vtable is the address of any pointer to the locator, plus PS.
+
+5.5 Output: fill section A of SCOUT_REPORT.md
+  - singletons with candidate roots
+  - top entity classes and their counts
+  - classes that look like handles, pools, AI, factions or spawning
+
+
+================================================================================
+6. PHASE 4 - ANCHOR ON THE PLAYER (1 h)
+================================================================================
+  - Value scans: health/ammo (int or float). Position: float scans while
+    moving (increased/decreased value). The vertical axis is often the 2nd
+    coordinate.
+  - On the found address: "find out what writes/accesses" -> the instruction
+    -> the base register = the owning object -> className(owner).
+  - Walk up the owners until you reach a singleton from Phase 3. That is the
+    player root (L.A. Noire: [PlayableCharacterManager]+0x10 = player,
+    +0x14 = partner).
+  - Make sure the root points at YOU and not at a companion: move while
+    another character stands still. On L.A. Noire the two slots once read
+    backwards.
+  - Record: the player object class, its position offset, state/health
+    offsets, and the root path. Confirm after a level reload.
+
+
+================================================================================
+7. PHASE 5 - ENTITIES, STATES, NAMES (2-4 h)
+================================================================================
+  - Use the Phase 3 instance list of the player's class (and its
+    parent/sibling classes) to get every NPC. Read position from each and
+    compute the distance to the player.
+  - Look for an entity list or manager that owns them: a singleton holding an
+    array or vector of those pointers. Read [vector+begin] / [vector+end].
+  - State objects: a pointer field whose className() changes with behaviour
+    (L.A. Noire: Actor_OnFoot, Actor_Shooting, Actor_Dead...). It is a free
+    and very reliable state readout.
+  - "Brain" objects: a pointer from the visible object to an AI object (L.A.
+    Noire: ActorInstance+0xC8 -> Actor). Profession/role/faction pointers are
+    often RTTI-named too.
+  - Build a small read-only watcher that logs, per entity: class, state name,
+    distance and handle field (Phase 7). Every later test uses it.
+
+
+================================================================================
+8. PHASE 6 - THE GAME-THREAD HOOK (half a day)
+================================================================================
+You need ONE function that runs on the game's main or AI thread every frame
+(or for every actor every frame). All calls into game functions go through a
+queue there (R2).
+
+Finding candidates:
+  - Ghidra: callers of QueryPerformanceCounter, timeGetTime or the D3D Present
+    call site lead to the main loop. Its per-frame callees (population update,
+    AI update, world update) are candidates.
+  - Cheat Engine: "find out what accesses" an NPC's position or state, then
+    count hits over a few seconds. About fps x actors per second = a per-actor
+    update; about fps per second = a per-frame update.
+  - L.A. Noire used two: 005CB280 (per-actor AI re-plan gate, ESI = Actor) and
+    0090A420 (population update, main thread, safe for spawning).
+
+Hook checklist (R9):
+  - The first 5+ bytes at the hook site must be self-contained instructions
+    (no relative call/jmp, or re-encode them).
+  - The cave: save registers/flags, process the queue slots, restore, run the
+    stolen original instructions, jump back.
+  - Queue design: fixed slots in the cave's data block (pointer + operation +
+    argument). The Lua side only WRITES a request and READS results/counters.
+  - Calling a game function: check whether it cleans its own arguments
+    ("ret N") or the caller does. A wrong guess corrupts the stack.
+    (L.A. Noire spawn 006253B0 was stdcall "ret 1C"; a wrapper assuming cdecl
+    crashed.)
+  - Check the code end against the cave's allocation size (a cave overflowed
+    into its data once).
+  - Verify the original bytes on load. Restore them on unload and when the
+    game process disappears.
+
+
+================================================================================
+9. PHASE 7 - THE LIFETIME SYSTEM (do this BEFORE any mass spawning or killing)
+================================================================================
+Almost every L.A. Noire crash came from object lifetimes, not from AI logic.
+Answer these questions with evidence (Ghidra + live watches):
+  Q1  How do objects refer to each other? Raw pointers, handles (small
+      integers into a table), reference-counted smart pointers, or IDs?
+  Q2  If handles: where is the table? Entry layout (refcount, object)? How
+      does a handle get freed (refcount reaches 0, then a free list)? Is there
+      a FORCE-CLEAR path that ignores the refcount (pool return, streaming,
+      event cleanup)?
+  Q3  Who owns an object? Is there an "owner reference" that the death or
+      despawn logic releases? (L.A. Noire: the engine released one owner
+      reference about 4 s after death; a mod-created handle must start at
+      rc=2: one owner reference for the engine plus one for the mod.)
+  Q4  Which systems store handles WITHOUT counting a reference (squads,
+      awareness lists, cover, relationships, events)? Those break first when
+      a handle is reused.
+  Q5  How does the population system cull or despawn? Is there a keep-alive
+      or pin flag? (L.A. Noire: Actor+0x1C4; the game also writes it.)
+  Q6  What happens at death, at despawn, at level reload, and when the
+      player is far away?
+
+Method:
+  - Watch one NPC's handle field and its table entry's refcount across:
+    spawn -> combat -> death -> body cleanup. Use one-shot, auto-continue
+    hardware write watches. Log the writer address and stack.
+  - Ghidra: decompile the acquire and release functions and list all their
+    callers (complete list, R8).
+  - Write the answers into SCOUT_REPORT.md section C. Mass spawning and corpse
+    cleanup come only after Q1-Q6 are answered.
+
+
+================================================================================
+10. PHASE 8 - SPAWN, WEAPONS, AI LEVERS (1-3 days)
+================================================================================
+SPAWN
+  - Watch the entity list or manager while the game spawns NPCs naturally
+    (walk or drive around). Catch the writer -> call stack -> the "spawn from
+    template" function and its arguments (template object, position/transform
+    block, pool).
+  - Call it ONLY from the main-thread hook. Pin fresh spawns if the
+    population system culls them.
+
+WEAPONS
+  - Find the give/equip functions from the player's weapon pickup or the
+    weapon-switch code. Check the weapon type object (RTTI name) at every call.
+
+AI LEVERS (look for these classes in the census)
+  - Behaviour plans/trees: a per-NPC plan ID or pointer, and a "re-plan" gate
+    (L.A. Noire: Actor+0x1E8 plus forced re-plan at 005CB280). Changing the
+    plan only takes effect after a re-plan.
+  - Plans may load and unload with the area. Check validity by class and name
+    on every use; never cache IDs.
+  - Hostility: factions and/or an explicit relationship pair table (L.A. Noire
+    used a pair table, not factions).
+  - Perception/awareness: per-NPC lists of known actors with last-seen data.
+    Creating or refreshing an entry can make distant NPCs pursue.
+  - Squads/groups and cover systems: they hold handles without counting them
+    (Q4).
+  - If the game has a native wanted/alert system, find and DRIVE it instead
+    of rebuilding one.
+  - Script VM: if found in 3.3, the registered native functions are usually
+    the safest levers of all.
+
+
+================================================================================
+11. PHASE 9 - DATA FILES (in parallel)
+================================================================================
+  - Find community unpackers for the game's archives. Read AI plans, faction
+    tables, spawn templates, weapon definitions and perception radii as data.
+  - Read only first. Repack only with backups, and never distribute game files.
+
+
+================================================================================
+12. CRASH WORKFLOW (every crash, before the next change)
+================================================================================
+  1. Get the newest .dmp and the log tail.
+  2. Decode with Python (minidump + capstone):
+       - use the EXCEPTION STREAM's thread context (the thread list context
+         can be the wrong frame)
+       - exception code and address, registers, disassembly around EIP/RIP
+       - stack scan for module return addresses
+  3. Map the address to a function in Ghidra: decompile it, see what it reads.
+  4. Match against the log: what changed in the last seconds (deaths,
+     releases, plan changes, reuse)?
+  5. Find the ROOT CAUSE, usually a lifetime violation (Phase 7). Fix the
+     cause, not the crash site (R3).
+  6. Note it in MODLOG.md: symptom -> cause -> fix -> how it was verified.
+  Signals worth knowing:
+    - reading a small address such as 0x24 = an object's vtable was zero
+      (destroyed object)
+    - an "object pointer" that points into the handle table itself = a FREED
+      handle on the free list
+    - EIP inside your own allocated memory = your cave crashed
+    - EIP in heap memory, or a small value like 0x4 = a call through a dead
+      object's vtable
+    - an access violation at "address -1" on movaps = a stack misalignment
+      (a hook path left esp off by 4)
+
+
+================================================================================
+13. SCOUT_REPORT.md TEMPLATE (fill in as you go; mark VERIFIED or GUESS)
+================================================================================
+  # <Game> scout report  (build ____, exe sha256 ____)
+  ## 0. Facts
+     bitness | base fixed? (value) | engine | script VM | anti-cheat: none
+     Ghidra project path | rebased to ____ or offsets
+  ## A. Engine map (RTTI census)
+     singletons: class | object | static root(s) | verified across restart?
+     entity classes: class | live count | notes
+     interesting classes: handles/pools/AI/factions/spawn/weapons
+  ## B. Player and entities
+     player root path | player class | position/health/state offsets
+     entity list location | state-object field | AI/brain pointer
+  ## C. Lifetime system (Q1-Q6 answers with evidence)
+  ## D. Game-thread hook(s)
+     address | original bytes | thread | per-frame or per-actor | cave design
+  ## E. Spawn / weapons
+     functions | calling convention | arguments | thread requirement
+  ## F. AI levers
+     plans/behaviours | re-plan gate | hostility mechanism | perception |
+     squads/cover | native wanted system?
+  ## G. Data files
+     archive format | tool | interesting definitions found
+  ## H. Open questions and next tests
+
+
+================================================================================
+14. CHECKPOINTS (how to know a phase is done)
+================================================================================
+  Phase 0  dumps folder set, save backed up, build and hash recorded
+  Phase 1  engine and route chosen; protection OK; base fixed or not
+  Phase 2  Ghidra analysed and saved; MCP returns function lists; bytes match
+           Cheat Engine
+  Phase 3  census file exists; at least 5 singletons with candidate roots
+  Phase 4  player root verified after a reload; position readable
+  Phase 5  watcher lists nearby NPCs with class, state name and distance
+  Phase 6  hook installed and restored cleanly; a counter increments every
+           frame; one harmless queued call works
+  Phase 7  Q1-Q6 answered with evidence
+  Phase 8  spawn 1 NPC, give a weapon, make it hostile, kill it, and clean it
+           up with NO lifetime errors. Then scale 5 -> 10 -> 20, watching the
+           handle-loss and guard counters.
+
+ROUGH TIMELINE
+  Known engine with dumpers or a Lua API: 1-2 days to Phase 8 basics.
+  Custom C++ engine: 3-5 days to Phase 8 basics.
+  These are estimates, not promises.
+
+
+================================================================================
+15. FIRST MESSAGE TO SEND THE USER (agent)
+================================================================================
+  "I'll start by fingerprinting the game. Please:
+     1. Launch <Game> and wait for the main menu (not the intro videos).
+     2. In Cheat Engine, attach to <Game>.exe.
+     3. Tell me when that's done.
+   While you do that: do you have a backup of your saves, and can you run one
+   admin command for crash dumps? I'll give you the exact line."
+  Then: Phase 0 -> Phase 1 -> Phase 2 (Ghidra, guided) -> Phase 3 onward.
+================================================================================
